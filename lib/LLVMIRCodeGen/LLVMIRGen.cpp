@@ -819,6 +819,8 @@ LLVMIRGen::emitBufferAddress(llvm::IRBuilder<> &builder, Value *val,
   return kernel->args().begin() + bufferToArgNum[val];
 }
 
+bool has_merge;
+
 /// Implementation of emitDataParallelKernel where we guarantee that the number
 /// of arguments will be bound by 64.
 void LLVMIRGen::emitDataParallelKernelImpl(
@@ -838,7 +840,7 @@ void LLVMIRGen::emitDataParallelKernelImpl(
                              "libjit_stacked_kernel", llmodule_.get());
   // Mark all kernel function buffer parameters as no-alias, because above
   // we ensured that they are uniqued.
-  for (unsigned paramIdx = 0; paramIdx < bufferToArgNum.size(); ++paramIdx) {
+  for (unsigned paramIdx = 0; paramIdx < argTypes.size(); ++paramIdx) {
     kernelFunc->addParamAttr(paramIdx, llvm::Attribute::AttrKind::NoAlias);
   }
 
@@ -873,9 +875,30 @@ void LLVMIRGen::emitDataParallelKernelImpl(
 
   setCurrentDebugLocation(builder, *bundle.begin());
   // Emit a call of the kernel.
-  createUncheckedCall(builder, kernelFunc, buffers);
+  auto *call = createUncheckedCall(builder, kernelFunc, buffers);
   // Emit debug info for the generated data-parallel kernel.
   generateFunctionDebugInfo(kernelFunc);
+  if (has_merge) {
+    call->print(errs());
+    for (auto I : bufferToArgNum) {
+      auto *buf = I.first;
+      errs() << I.second << ": " << buf << " @" <<
+        allocationsInfo_.allocatedAddress_[buf] << "\n";
+    }
+    kernelFunc->print(errs());
+  }
+}
+
+/// Check if an operand exactly overlaps with another operand.
+///
+/// \param allocInfo information about allocations
+/// \param buf1 a buffer operand
+/// \param buf2 the buffer operand to be checked for overlaps with the \p buf1.
+static bool isExactBufferOverlap(AllocationsInfo &allocInfo, Value *buf1,
+                                  Value *buf2) {
+  return buf1->getType() == buf2->getType() &&
+    buf1->getSizeInBytes() == buf2->getSizeInBytes() &&
+    allocInfo.allocatedAddress_[buf1] == allocInfo.allocatedAddress_[buf2];
 }
 
 /// Emit the function that implements a data-parallel kernel and calls it.
@@ -904,6 +927,7 @@ void LLVMIRGen::emitDataParallelKernel(
   llvm::SmallVector<const Instruction *, 32> batchedBundle;
   // Collect unique buffers up to `kArgLimit` used by the instructions of the
   // kernel.
+  has_merge=false;
   for (const auto I : bundle) {
     // If adding the buffers of current instruction might make the total number
     // of unique buffer exceed `kArgLimit`, we need to emit the kernel and start
@@ -924,7 +948,28 @@ void LLVMIRGen::emitDataParallelKernel(
     batchedBundle.push_back(I);
     for (const auto &Op : I->getOperands()) {
       auto *buf = Op.first;
-      if (!bufferToArgNum.count(buf)) {
+      if (bufferToArgNum.count(buf))
+        continue;
+      bool isOverlap = false;
+      for (auto I : bufferToArgNum) {
+        auto *buf2 = I.first;
+        if (isExactBufferOverlap(allocationsInfo_, buf, buf2)) {
+          // buf has already been passed to kernel as buf2
+          assert(buf->getType() == buf2->getType());
+          bufferToArgNum[buf] = I.second;
+          isOverlap = true;
+          has_merge = true;
+          errs() << "#### Merged " << argTypes.size() << " into " << I.second
+            << "\n";
+          errs() << buf << " @" << allocationsInfo_.allocatedAddress_[buf] << "\n";
+          errs() << buf2 << " @" << allocationsInfo_.allocatedAddress_[buf2] << "\n";
+          // keep the arguments (should be removed)
+          buffers.push_back(emitValueAddress(builder, buf));
+          argTypes.push_back(getElementType(builder, buf)->getPointerTo());
+         break;
+        }
+      }
+      if (!isOverlap) {
         bufferToArgNum[buf] = argTypes.size();
         buffers.push_back(emitValueAddress(builder, buf));
         argTypes.push_back(getElementType(builder, buf)->getPointerTo());
@@ -933,6 +978,25 @@ void LLVMIRGen::emitDataParallelKernel(
   }
   emitDataParallelKernelImpl(builder, batchedBundle, argTypes, bufferToArgNum,
                              buffers);
+}
+
+/// Check if the provided operand exactly overlaps with an operand of an
+/// instruction already in the bundle.
+///
+/// \param allocationsInfo information about allocations
+/// \param bundle current bundle of stacked instructions
+/// \param buf the buffer operand to be checked for overlaps with the \p bundle.
+static bool isExactOverlapWithAnyBundleBufferOperands(
+    AllocationsInfo &allocationsInfo,
+    llvm::SmallVectorImpl<const Instruction *> &bundle, Value *buf) {
+  for (auto bi : bundle) {
+    for (auto bop : bi->getOperands()) {
+      auto buf2 = bop.first;
+      if (isExactBufferOverlap(allocationsInfo, buf, buf2))
+        return true; // The two buffers are the exact same memory region.
+    }
+  }
+  return false;
 }
 
 /// Check if the provided operand overlaps with an operand of an instruction
@@ -1018,6 +1082,15 @@ void LLVMIRGen::generateLLVMIRForModule(llvm::IRBuilder<> &builder) {
     // instruction cannot be included into the data-parallel bundle, because
     // overlapping operand buffers are not data parallel.
     for (auto op : I.getOperands()) {
+#if 1
+      if (isExactOverlapWithAnyBundleBufferOperands(
+          allocationsInfo_, bundle, op.first)) {
+        // allow exact overlaps because we will merge them when generating
+        // the kernel function
+        continue;
+      }
+#endif
+
       // If a mutated operand buffer overlaps with any buffer already used by
       // the bundle, or if a non-mutated operand overlaps with a mutated buffer
       // used by bundle the current instruction cannot become a part of the
